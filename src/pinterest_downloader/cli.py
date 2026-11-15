@@ -160,6 +160,11 @@ async def transfer(discovery, store, args, stop):
             store.state['expected'] = discovery.board.expected
             store.state['notes'] = list(dict.fromkeys(discovery.board.notes + errors))
             count_matches = discovery.board.expected is None or discovery.board.expected == len(store.state['pins'])
+            if discovery.board.verified and not count_matches:
+                store.state['notes'].append(
+                    f"Feed ended normally, but Pinterest reports {discovery.board.expected} pins "
+                    f"and {len(store.state['pins'])} unique pins were discovered. The count difference is unresolved."
+                )
             verified = discovery.board.verified and not errors and count_matches
             store.state['discovery'] = 'verified feed exhaustion' if verified else 'incomplete or unverified'
     return errors
@@ -193,7 +198,16 @@ async def run(args):
             try:
                 await discovery.open()
                 name = 'pin-' + discovery.board.name if args.command == 'pin' else discovery.board.name
-                store = Store(args.dest, name, args.url)
+                destination = args.dest
+                if discovery.board.section_id:
+                    destination = destination / safe_name(discovery.board.name)
+                    name = discovery.board.section_name
+                store = Store(destination, name, args.url)
+                store.state['scope'] = 'section' if discovery.board.section_id else args.command
+                if discovery.board.section_id:
+                    store.state['board_name'] = discovery.board.name
+                    store.state['section_name'] = discovery.board.section_name
+                    store.state['section_id'] = discovery.board.section_id
                 print(f'Output: {store.folder.resolve()} | {args.workers} download workers', flush=True)
                 await transfer(discovery, store, args, stop)
             finally:
@@ -233,7 +247,7 @@ async def run(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Download Pinterest board or pin images, optionally using a saved login.')
+    parser = argparse.ArgumentParser(description='Download Pinterest board, board-section, or pin images, optionally using a saved login.')
     sub = parser.add_subparsers(dest='command', required=True)
     for command in ('login', 'logout'):
         child = sub.add_parser(command, help='Save a Firefox login' if command == 'login' else 'Remove the local saved login')

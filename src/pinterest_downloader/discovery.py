@@ -31,8 +31,8 @@ def canonical_url(value: str, mode: str) -> str:
     if mode == 'pin':
         if len(parts) != 2 or parts[0] != 'pin' or not valid_pin_id(parts[1]):
             raise ValueError('Expected https://www.pinterest.com/pin/PIN_ID/')
-    elif len(parts) != 2 or parts[0] in ('pin', 'search', 'ideas', 'settings', 'login'):
-        raise ValueError('Expected https://www.pinterest.com/USERNAME/BOARD/')
+    elif len(parts) not in (2, 3) or parts[0] in ('pin', 'search', 'ideas', 'settings', 'login'):
+        raise ValueError('Expected https://www.pinterest.com/USERNAME/BOARD/ or /USERNAME/BOARD/SECTION/')
     else:
         parts[0] = parts[0].lower()
     return 'https://www.pinterest.com/' + '/'.join(parts) + '/'
@@ -48,6 +48,8 @@ class Board:
     sections: dict[str, str] = field(default_factory=dict)
     verified: bool = False
     notes: list[str] = field(default_factory=list)
+    section_id: str = ''
+    section_name: str = ''
 
 
 DOM_PINS = """() => {
@@ -72,7 +74,10 @@ class Discovery:
     def __init__(self, context: BrowserContext, url: str, mode: str, stop: asyncio.Event, signed_in=False):
         self.context, self.url, self.mode, self.stop = context, url, mode, stop
         self.signed_in = signed_in
-        self.board = Board(url, urlsplit(url).path.strip('/').split('/')[-1])
+        parts = urlsplit(url).path.strip('/').split('/')
+        self.section_slug = parts[2] if mode == 'board' and len(parts) == 3 else None
+        self.parent_url = 'https://www.pinterest.com/' + '/'.join(parts[:2]) + '/'
+        self.board = Board(url, parts[1] if mode == 'board' else parts[-1])
         self.pace = Pace(5, stop)
         self.page: Page | None = None
         self.detail: Page | None = None
@@ -97,7 +102,7 @@ class Discovery:
             if '/resource/' not in response.url or response.status != 200:
                 return
             resource = response.url.split('/resource/', 1)[1].split('/')[0]
-            if resource not in ('BoardResource', 'BoardFeedResource', 'BoardSectionsResource', 'BoardSectionPinsResource'):
+            if resource not in ('BoardResource', 'BoardFeedResource', 'BoardSectionsResource', 'BoardSectionResource', 'BoardSectionPinsResource'):
                 return
             query = parse_qs(urlsplit(response.url).query)
             raw = query.get('data', ['{}'])[0]
@@ -148,26 +153,61 @@ class Discovery:
     def metadata(self, payload):
         for node in walk(payload):
             url = node.get('url', '')
-            same_url = isinstance(url, str) and urlsplit(url).path.rstrip('/').casefold() == urlsplit(self.url).path.rstrip('/').casefold()
-            if same_url and ('pin_count' in node or node.get('type') == 'board'):
+            same_url = isinstance(url, str) and urlsplit(url).path.rstrip('/').casefold() == urlsplit(self.parent_url).path.rstrip('/').casefold()
+            if same_url and node.get('type') != 'board_section' and ('pin_count' in node or node.get('type') == 'board'):
                 self.board.id = str(node.get('id', self.board.id))
                 self.board.name = node.get('name') or self.board.name
                 count = node.get('pin_count')
-                if isinstance(count, int) and not isinstance(count, bool):
+                if not self.section_slug and isinstance(count, int) and not isinstance(count, bool):
                     self.board.expected = count
                 section_count = node.get('section_count')
                 if isinstance(section_count, int):
                     self.board.section_count = section_count
 
+        if self.section_slug:
+            matches = {}
+            for node in walk(payload):
+                if node.get('type') != 'board_section' or not node.get('id'):
+                    continue
+                section_url = self.section_url(node)
+                if not section_url or urlsplit(section_url).path.rstrip('/').casefold() != urlsplit(self.url).path.rstrip('/').casefold():
+                    continue
+                matches[str(node['id'])] = node
+            if len(matches) > 1:
+                raise ValueError('Multiple sections match this URL; cannot determine the requested section safely.')
+            if matches:
+                section_id, node = next(iter(matches.items()))
+                self.board.section_id = section_id
+                self.board.section_name = node.get('title') or node.get('name') or self.section_slug
+                count = node.get('pin_count')
+                if isinstance(count, int) and not isinstance(count, bool):
+                    self.board.expected = count
+
+    def section_url(self, node):
+        owner = node.get('board')
+        if isinstance(owner, dict) and owner.get('id') and self.board.id and str(owner['id']) != self.board.id:
+            return None
+        url = node.get('url')
+        if not url and node.get('slug'):
+            url = str(node['slug']).strip('/') + '/'
+        if not isinstance(url, str):
+            return None
+        try:
+            full = canonical_url(urljoin(self.parent_url, url), 'board')
+        except ValueError:
+            return None
+        path = urlsplit(full).path
+        if len(path.strip('/').split('/')) != 3 or not path.casefold().startswith(urlsplit(self.parent_url).path.casefold()):
+            return None
+        return full
+
     def add_sections(self, payload):
         for node in walk(payload):
-            if node.get('type') != 'board_section':
+            if node.get('type') != 'board_section' or not node.get('id'):
                 continue
-            url = node.get('url')
-            if isinstance(url, str):
-                full = urljoin(self.url, url)
-                if urlsplit(full).hostname == 'www.pinterest.com' and urlsplit(full).path.startswith(urlsplit(self.url).path):
-                    self.board.sections[str(node['id'])] = full
+            full = self.section_url(node)
+            if full:
+                self.board.sections[str(node['id'])] = full
 
     async def open(self):
         self.page = await self.context.new_page()
@@ -178,8 +218,10 @@ class Discovery:
         if self.tasks:
             await asyncio.gather(*list(self.tasks))
         for resource, options, payload in self.responses:
-            if resource == 'BoardResource':
+            if resource in ('BoardResource', 'BoardSectionResource'):
                 self.metadata(payload)
+        if self.section_slug and not self.board.section_id:
+            raise ValueError('Could not identify the requested section. Check the URL and login; the parent board will not be downloaded instead.')
         if not self.board.name:
             self.board.name = 'board'
 
@@ -191,6 +233,15 @@ class Discovery:
             return
         if not self.board.id:
             self.board.notes.append('Board identity unavailable; DOM results cannot prove board membership or completeness.')
+        if self.board.section_id:
+            scan = await self.scan_to_queue(self.board.section_id)
+            async for pin in scan:
+                yield pin
+            membership_verified = self.seen <= self.authoritative
+            self.board.verified = self._scan_verified and membership_verified and bool(self.board.id)
+            if not membership_verified:
+                self.board.notes.append('Some pins were found only in the DOM; section membership is unverified for those pins.')
+            return
         verified = await self.scan_to_queue(None)
         async for pin in verified:
             yield pin
@@ -255,7 +306,7 @@ class Discovery:
                 found = []
                 responses, self.responses = self.responses, []
                 for resource, options, payload in responses:
-                    if resource == 'BoardResource':
+                    if resource in ('BoardResource', 'BoardSectionResource'):
                         self.metadata(payload)
                     board_match = bool(self.board.id) and str(options.get('board_id')) == self.board.id
                     section_match = section is not None and str(options.get('section_id')) == section
@@ -296,12 +347,13 @@ class Discovery:
                 links = await self.page.locator('a[href]').evaluate_all('(els) => els.map(e => e.href)')
                 for link in links:
                     p = urlsplit(link)
-                    if p.hostname == 'www.pinterest.com' and p.path.startswith(urlsplit(self.url).path):
-                        suffix = p.path[len(urlsplit(self.url).path):].strip('/')
+                    if p.hostname in ('www.pinterest.com', 'in.pinterest.com') and p.path.casefold().startswith(urlsplit(self.parent_url).path.casefold()):
+                        suffix = p.path[len(urlsplit(self.parent_url).path):].strip('/')
                         if suffix and '/' not in suffix:
                             # Need a real section ID from data before requesting this feed.
                             for node in walk(self.initial):
-                                if node.get('type') == 'board_section' and urlsplit(str(node.get('url', ''))).path.rstrip('/') == p.path.rstrip('/'):
+                                section_url = self.section_url(node) if node.get('type') == 'board_section' else None
+                                if section_url and urlsplit(section_url).path.rstrip('/').casefold() == p.path.rstrip('/').casefold():
                                     self.add_sections(node)
                 if exhausted:
                     self._scan_verified = True

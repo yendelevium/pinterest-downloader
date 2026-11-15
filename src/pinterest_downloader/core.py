@@ -136,6 +136,8 @@ def report(state: dict) -> str:
              f"Unique pins discovered: {len(pins)}",
              ' | '.join(f'{k}: {v}' for k, v in counts.items()),
              f"Verified image files: {sum(len(p.get('files', [])) for p in pins.values())}"]
+    if state.get('scope') == 'section':
+        lines.insert(1, f"Scope: section — {state['board_name']} / {state['section_name']}")
     if expected is not None:
         lines.append(f"Undiscovered count gap: {max(0, expected - len(pins))} (URLs unknown)")
         if len(pins) > expected:

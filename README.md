@@ -29,12 +29,19 @@ Sign in in the Firefox window. The window closes when the session is saved, and 
 
 ```bash
 uv run pinterest-downloader board "https://www.pinterest.com/USERNAME/BOARD/" --dest ./downloads
+uv run pinterest-downloader board "https://www.pinterest.com/USERNAME/BOARD/SECTION/" --dest ./downloads
 uv run pinterest-downloader pin "https://www.pinterest.com/pin/PIN_ID/" --dest ./downloads
 ```
 
 Full `pinterest.com` and `in.pinterest.com` URLs are supported. Quote URLs and paths containing spaces.
 
-Output goes into `<dest>/<board-name>/` or `<dest>/pin-<id>/`, alongside `report.txt` and `manifest.json`. The report compares discovered pins with Pinterest's reported count and lists failures and resolution fallbacks. Rerun the same command to resume; verified existing images are reused.
+Collaborative boards use the same command and your saved login. A URL ending in `/BOARD/SECTION/` downloads only that section; the parent `/BOARD/` URL downloads the whole board, including its sections. For example:
+
+```bash
+uv run pinterest-downloader board "https://in.pinterest.com/EnigmaticStardust/animation-reference/yendelevium/" --dest ./downloads
+```
+
+Output goes into `<dest>/<board-name>/`, `<dest>/<board-name>/<section-name>/` for a selected section, or `<dest>/pin-<id>/`, alongside `report.txt` and `manifest.json`. Section reports use the section's pin count. The report compares discovered pins with Pinterest's reported count and lists failures and resolution fallbacks. Rerun the same command to resume; verified existing images are reused.
 
 ### Download options
 
