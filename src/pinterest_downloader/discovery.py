@@ -69,8 +69,9 @@ DOM_PINS = """() => {
 
 
 class Discovery:
-    def __init__(self, context: BrowserContext, url: str, mode: str, stop: asyncio.Event):
+    def __init__(self, context: BrowserContext, url: str, mode: str, stop: asyncio.Event, signed_in=False):
         self.context, self.url, self.mode, self.stop = context, url, mode, stop
+        self.signed_in = signed_in
         self.board = Board(url, urlsplit(url).path.strip('/').split('/')[-1])
         self.pace = Pace(5, stop)
         self.page: Page | None = None
@@ -119,7 +120,7 @@ class Discovery:
             raise AccessBlocked(self.network_block)
         path = urlsplit(page.url).path
         if path.startswith(('/login', '/auth', '/challenge')):
-            raise AccessBlocked('Pinterest requires login or a challenge; public-only mode stopped.')
+            raise AccessBlocked('Pinterest requires login or a challenge. Run `pinterest-downloader login` to sign in or refresh your session.')
         text = (await page.locator('body').inner_text())[:12000].lower()
         if any(s in text for s in ('verify you are human', 'verify you’re human', 'access denied', 'too many requests')):
             raise AccessBlocked('Pinterest access challenge detected; stopped.')
@@ -288,7 +289,8 @@ class Discovery:
                         self.seen.add(pin.id)
                         yield pin
                 if await self.page.locator('input[type="password"]:visible').count():
-                    self.board.notes.append('Pinterest displayed a sign-in wall. Public-only discovery cannot access the remaining pins.')
+                    explanation = 'The saved session may have expired or been revoked.' if self.signed_in else 'Public access cannot reach the remaining pins.'
+                    self.board.notes.append(f'Pinterest displayed a sign-in wall. {explanation} Run `pinterest-downloader login` and retry to resume.')
                     return
                 # Section links are filtered to this board's URL, not arbitrary navigation.
                 links = await self.page.locator('a[href]').evaluate_all('(els) => els.map(e => e.href)')

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
+import sys
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -36,6 +37,7 @@ class Pace:
         self.blocked = ''
         self.throttles = 0
         self.stop = stop
+        self.forbidden_streak = 0
 
     async def wait(self):
         async with self.lock:
@@ -56,6 +58,15 @@ class Pace:
         self.cool_until = max(self.cool_until, time.monotonic() + max(60, retry_after(header)))
         if self.throttles >= 3:
             self.blocked = 'Stopped after repeated HTTP 429 responses; retry later.'
+
+    def forbidden(self, header=None) -> float:
+        """Slow all workers on 403 without cancelling unrelated images."""
+        self.forbidden_streak += 1
+        delay = min(60, 5 * 2 ** min(self.forbidden_streak - 1, 4))
+        if header is not None:
+            delay = max(delay, retry_after(header))
+        self.cool_until = max(self.cool_until, time.monotonic() + delay)
+        return delay
 
 
 def digest(path: Path):
@@ -85,8 +96,9 @@ class Downloader:
         if part.is_symlink():
             raise ValueError(f'Refusing symlink: {part}')
         errors = []
+        forbidden_retries = 2  # Shared across this asset's URL candidates.
         try:
-            for url in urls:
+            for url in dict.fromkeys(urls):
                 if not image_url(url):
                     continue
                 for attempt in range(3):
@@ -96,8 +108,18 @@ class Downloader:
                             if response.status_code == 429:
                                 self.pace.throttle(response.headers.get('retry-after'))
                                 continue
-                            if response.status_code in (401, 403):
-                                self.pace.blocked = f'Image host returned HTTP {response.status_code}; stopped to avoid repeated blocked requests.'
+                            if response.status_code == 403:
+                                delay = self.pace.forbidden(response.headers.get('retry-after'))
+                                errors.append(f'HTTP 403: {url}')
+                                retry = forbidden_retries > 0 and attempt < 2
+                                action = 'retrying this URL' if retry else 'trying any remaining resolutions; other pins will continue'
+                                print(f'Image HTTP 403: {url}; shared cooldown {delay:g}s, {action}.', file=sys.stderr, flush=True)
+                                if retry:
+                                    forbidden_retries -= 1
+                                    continue
+                                break
+                            if response.status_code == 401:
+                                self.pace.blocked = f'Image host returned HTTP 401 for {url}; stopped to avoid repeated unauthorized requests.'
                                 raise AccessBlocked(self.pace.blocked)
                             if response.status_code in (404, 410):
                                 errors.append(f'{response.status_code}: {url}')
@@ -114,6 +136,7 @@ class Downloader:
                         filename = f'{pin_id}_{index}.{extension}'
                         checksum = await asyncio.to_thread(digest, part)
                         part.replace(self.folder / filename)
+                        self.pace.forbidden_streak = 0
                         return {'index': index, 'name': filename, 'url': url, 'sha256': checksum}, False
                     except (httpx.HTTPError, OSError, ValueError) as exc:
                         errors.append(f'{url}: {exc}')
@@ -123,6 +146,6 @@ class Downloader:
                             await asyncio.sleep(2 ** (attempt + 1))
                 if self.pace.blocked:
                     raise AccessBlocked(self.pace.blocked)
-            raise ValueError('; '.join(errors[-4:]) or 'No usable image URLs')
+            raise ValueError('; '.join(dict.fromkeys(errors)) or 'No usable image URLs')
         finally:
             part.unlink(missing_ok=True)

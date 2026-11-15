@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 from playwright.async_api import async_playwright
 
+from .auth import default_session_file, load_session, login, logout
 from .core import atomic_json, report, safe_name
 from .discovery import Discovery, canonical_url
 from .download import AccessBlocked, Downloader, Pace
@@ -171,13 +172,16 @@ async def run(args):
     fatal = False
     interrupted = False
     try:
+        session_path = args.session_file or default_session_file()
+        state = None if args.no_session else load_session(session_path, required=args.session_file is not None)
+        print('Using saved Pinterest login.' if state else 'Using public access without a saved login.', flush=True)
         async with async_playwright() as playwright:
             browser_type = getattr(playwright, args.browser)
             launch_options = {'headless': not args.headed}
             if args.browser == 'chromium':
                 launch_options['channel'] = args.browser_channel or 'chromium'
             browser = await browser_type.launch(**launch_options)
-            context = await browser.new_context(viewport={'width': 1280, 'height': 900})
+            context = await browser.new_context(viewport={'width': 1280, 'height': 900}, storage_state=state)
             # Browser previews duplicate HTTP downloads; retain scripts/XHR needed for rendering.
             async def route(request):
                 if request.request.resource_type in ('image', 'media', 'font'):
@@ -185,7 +189,7 @@ async def run(args):
                 else:
                     await request.continue_()
             await context.route('**/*', route)
-            discovery = Discovery(context, args.url, args.command, stop)
+            discovery = Discovery(context, args.url, args.command, stop, signed_in=state is not None)
             try:
                 await discovery.open()
                 name = 'pin-' + discovery.board.name if args.command == 'pin' else discovery.board.name
@@ -229,8 +233,11 @@ async def run(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Download still images from public Pinterest boards or pins.')
+    parser = argparse.ArgumentParser(description='Download Pinterest board or pin images, optionally using a saved login.')
     sub = parser.add_subparsers(dest='command', required=True)
+    for command in ('login', 'logout'):
+        child = sub.add_parser(command, help='Save a Firefox login' if command == 'login' else 'Remove the local saved login')
+        child.add_argument('--session-file', type=Path, default=default_session_file())
     for command in ('board', 'pin'):
         child = sub.add_parser(command)
         child.add_argument('url')
@@ -242,7 +249,24 @@ def main():
                            help='Discovery browser (default: firefox)')
         child.add_argument('--browser-channel', choices=['chrome', 'chromium'], default=None,
                            help='Optional channel for --browser chromium')
+        session = child.add_mutually_exclusive_group()
+        session.add_argument('--session-file', type=Path, help='Use this saved session instead of the default')
+        session.add_argument('--no-session', action='store_true', help='Ignore saved login and use public access')
     args = parser.parse_args()
+    if args.command in ('login', 'logout'):
+        try:
+            if args.command == 'logout':
+                logout(args.session_file)
+                code = 0
+            else:
+                code = asyncio.run(login(args.session_file))
+        except KeyboardInterrupt:
+            print('Login cancelled; existing saved session was not changed.')
+            code = 1
+        except Exception as exc:
+            print(f'{type(exc).__name__}: {exc}', file=sys.stderr)
+            code = 2
+        sys.exit(code)
     try:
         args.url = canonical_url(args.url, args.command)
     except ValueError as exc:
