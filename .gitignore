@@ -4,8 +4,10 @@ __pycache__/
 *.egg-info/
 dist/
 downloads/
+tests
 *.part
 # Browser sessions contain account cookies. Keep custom session paths out of Git.
 .pinterest-session/
 session.json
 *.session.json
+notes.md
